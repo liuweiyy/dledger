@@ -21,7 +21,7 @@ import io.openmessaging.storage.dledger.DLedger;
 import io.openmessaging.storage.dledger.DLedgerConfig;
 import java.util.HashMap;
 import java.util.Map;
-
+// 命令行主函数 主类
 public class BossCommand {
 
     public static void main(String args[]) {

@@ -31,6 +31,7 @@ public class DLedger {
         DLedgerServer dLedgerServer = new DLedgerServer(dLedgerConfig);
         dLedgerServer.startup();
         logger.info("[{}] group {} start ok with config {}", dLedgerConfig.getSelfId(), dLedgerConfig.getGroup(), JSON.toJSONString(dLedgerConfig));
+        // kill -15 善后工作
         Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
             private volatile boolean hasShutdown = false;
 

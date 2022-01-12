@@ -89,9 +89,13 @@ public class DLedgerServer implements DLedgerProtocolHander {
 
 
     public void startup() {
+        // 存储模块启动
         this.dLedgerStore.startup();
+        // 通信模块启动
         this.dLedgerRpcService.startup();
+        // 复制模块启动
         this.dLedgerEntryPusher.startup();
+        // 选举模块启动
         this.dLedgerLeaderElector.startup();
         executorService.scheduleAtFixedRate(this::checkPreferredLeader, 1000, 1000, TimeUnit.MILLISECONDS);
     }

@@ -58,9 +58,10 @@ public class DLedgerLeaderElector {
     //as a client
     private long nextTimeToRequestVote = -1;
     private volatile boolean needIncreaseTermImmediately = false;
+    // 防止选票被瓜分，定义投票时间间隔
     private int minVoteIntervalMs = 300;
     private int maxVoteIntervalMs = 1000;
-
+    // roleChangeHandler角色改变之后的处理，比如把角色透传给rocketmq的broker
     private List<RoleChangeHandler> roleChangeHandlers = new ArrayList<>();
 
     private VoteResponse.ParseResult lastParseResult = VoteResponse.ParseResult.WAIT_TO_REVOTE;
@@ -151,6 +152,7 @@ public class DLedgerLeaderElector {
     public void changeRoleToLeader(long term) {
         synchronized (memberState) {
             if (memberState.currTerm() == term) {
+                // 角色变成leader
                 memberState.changeToLeader(term);
                 lastSendHeartBeatTime = -1;
                 handleRoleChange(term, MemberState.Role.LEADER);
@@ -191,36 +193,38 @@ public class DLedgerLeaderElector {
     public CompletableFuture<VoteResponse> handleVote(VoteRequest request, boolean self) {
         //hold the lock to get the latest term, leaderId, ledgerEndIndex
         synchronized (memberState) {
+            // leaderId不在集群中
             if (!memberState.isPeerMember(request.getLeaderId())) {
                 logger.warn("[BUG] [HandleVote] remoteId={} is an unknown member", request.getLeaderId());
                 return CompletableFuture.completedFuture(new VoteResponse(request).term(memberState.currTerm()).voteResult(VoteResponse.RESULT.REJECT_UNKNOWN_LEADER));
             }
+            // 不是自己，但请求投票的id等于自己的
             if (!self && memberState.getSelfId().equals(request.getLeaderId())) {
                 logger.warn("[BUG] [HandleVote] selfId={} but remoteId={}", memberState.getSelfId(), request.getLeaderId());
                 return CompletableFuture.completedFuture(new VoteResponse(request).term(memberState.currTerm()).voteResult(VoteResponse.RESULT.REJECT_UNEXPECTED_LEADER));
             }
-
+            //raft协议投成功票的一个条件:最后一个日志条目的必须大: 1.term大2.term一样index大
             if (request.getLedgerEndTerm() < memberState.getLedgerEndTerm()) {
                 return CompletableFuture.completedFuture(new VoteResponse(request).term(memberState.currTerm()).voteResult(VoteResponse.RESULT.REJECT_EXPIRED_LEDGER_TERM));
             } else if (request.getLedgerEndTerm() == memberState.getLedgerEndTerm() && request.getLedgerEndIndex() < memberState.getLedgerEndIndex()) {
                 return CompletableFuture.completedFuture(new VoteResponse(request).term(memberState.currTerm()).voteResult(VoteResponse.RESULT.REJECT_SMALL_LEDGER_END_INDEX));
             }
-
+            // 请求的term小于自己当前的term
             if (request.getTerm() < memberState.currTerm()) {
                 return CompletableFuture.completedFuture(new VoteResponse(request).term(memberState.currTerm()).voteResult(VoteResponse.RESULT.REJECT_EXPIRED_VOTE_TERM));
             } else if (request.getTerm() == memberState.currTerm()) {
                 if (memberState.currVoteFor() == null) {
-                    //let it go
+                    //let it go 未投票
                 } else if (memberState.currVoteFor().equals(request.getLeaderId())) {
-                    //repeat just let it go
+                    //repeat just let it go 当前的投票就是请求投的
                 } else {
                     if (memberState.getLeaderId() != null) {
                         return CompletableFuture.completedFuture(new VoteResponse(request).term(memberState.currTerm()).voteResult(VoteResponse.RESULT.REJECT_ALREADY_HAS_LEADER));
-                    } else {
+                    } else { // 已经投票了
                         return CompletableFuture.completedFuture(new VoteResponse(request).term(memberState.currTerm()).voteResult(VoteResponse.RESULT.REJECT_ALREADY_VOTED));
                     }
                 }
-            } else {
+            } else {// 请求的term大于自己当前的term
                 //stepped down by larger term
                 changeRoleToCandidate(request.getTerm());
                 needIncreaseTermImmediately = true;
@@ -333,6 +337,7 @@ public class DLedgerLeaderElector {
                 leaderId = memberState.getLeaderId();
                 lastSendHeartBeatTime = System.currentTimeMillis();
             }
+            // 发送心跳
             sendHeartbeats(term, leaderId);
         }
     }
@@ -351,7 +356,9 @@ public class DLedgerLeaderElector {
     private List<CompletableFuture<VoteResponse>> voteForQuorumResponses(long term, long ledgerEndTerm,
         long ledgerEndIndex) throws Exception {
         List<CompletableFuture<VoteResponse>> responses = new ArrayList<>();
+        // 给group中所有机器发请求投票信息
         for (String id : memberState.getPeerMap().keySet()) {
+            // 构造voteRequest
             VoteRequest voteRequest = new VoteRequest();
             voteRequest.setGroup(memberState.getGroup());
             voteRequest.setLedgerEndIndex(ledgerEndIndex);
@@ -360,8 +367,10 @@ public class DLedgerLeaderElector {
             voteRequest.setTerm(term);
             voteRequest.setRemoteId(id);
             CompletableFuture<VoteResponse> voteResponse;
+            // 处理自己的投票
             if (memberState.getSelfId().equals(id)) {
                 voteResponse = handleVote(voteRequest, true);
+            // 给其他节点发送请求投票的信息
             } else {
                 //async
                 voteResponse = dLedgerRpcService.vote(voteRequest);
@@ -390,6 +399,7 @@ public class DLedgerLeaderElector {
 
     private void maintainAsCandidate() throws Exception {
         //for candidate
+        // term一致才能投票，term小的时候会设置needIncreaseTermImmediately
         if (System.currentTimeMillis() < nextTimeToRequestVote && !needIncreaseTermImmediately) {
             return;
         }

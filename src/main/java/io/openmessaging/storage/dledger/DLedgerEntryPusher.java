@@ -55,14 +55,16 @@ public class DLedgerEntryPusher {
     private final MemberState memberState;
 
     private DLedgerRpcService dLedgerRpcService;
-
+    // leader use
+    //<term, < peer , watermarks>> watermarks:节点id对应的节点日志与leader日志已经确认一致的日志条目的最大的index的记
     private Map<Long, ConcurrentMap<String, Long>> peerWaterMarksByTerm = new ConcurrentHashMap<>();
+    //<term,<index,future>>
     private Map<Long, ConcurrentMap<Long, TimeoutFuture<AppendEntryResponse>>> pendingAppendResponsesByTerm = new ConcurrentHashMap<>();
-
+    // follower use
     private EntryHandler entryHandler;
-
+    // leader use check quorum
     private QuorumAckChecker quorumAckChecker;
-
+    //leader use，peer EntryDispatcher，除自己外的所有机器均有一个分发线程
     private Map<String, EntryDispatcher> dispatcherMap = new HashMap<>();
 
     public DLedgerEntryPusher(DLedgerConfig dLedgerConfig, MemberState memberState, DLedgerStore dLedgerStore,
@@ -140,7 +142,9 @@ public class DLedgerEntryPusher {
     }
 
     public CompletableFuture<AppendEntryResponse> waitAck(DLedgerEntry entry, boolean isBatchWait) {
+        // 更新自己的当前term最大index
         updatePeerWaterMark(entry.getTerm(), memberState.getSelfId(), entry.getIndex());
+        // 只有一台机器，则无需判定了
         if (memberState.getPeerMap().size() == 1) {
             AppendEntryResponse response = new AppendEntryResponse();
             response.setGroup(memberState.getGroup());
@@ -334,9 +338,11 @@ public class DLedgerEntryPusher {
         private long term = -1;
         private String leaderId = null;
         private long lastCheckLeakTimeMs = System.currentTimeMillis();
+        //<index,time>
         private ConcurrentMap<Long, Long> pendingMap = new ConcurrentHashMap<>();
         private ConcurrentMap<Long, Pair<Long, Integer>> batchPendingMap = new ConcurrentHashMap<>();
         private PushEntryRequest batchAppendEntryRequest = new PushEntryRequest();
+        // 以秒为单位发送量的统计，5个窗口
         private Quota quota = new Quota(dLedgerConfig.getPeerPushQuota());
 
         public EntryDispatcher(String peerId, Logger logger) {
@@ -420,6 +426,7 @@ public class DLedgerEntryPusher {
                             updatePeerWaterMark(x.getTerm(), peerId, x.getIndex());
                             quorumAckChecker.wakeup();
                             break;
+                            // 状态不一致，重新compare
                         case INCONSISTENT_STATE:
                             logger.info("[Push-{}]Get INCONSISTENT_STATE when push index={} term={}", peerId, x.getIndex(), x.getTerm());
                             changeState(-1, PushEntryRequest.Type.COMPARE);
@@ -478,11 +485,13 @@ public class DLedgerEntryPusher {
                 if (type.get() != PushEntryRequest.Type.APPEND) {
                     break;
                 }
+                // 写入的index大于当前日志的最大index
                 if (writeIndex > dLedgerStore.getLedgerEndIndex()) {
                     doCommit();
                     doCheckAppendResponse();
                     break;
                 }
+                // 清理失效的index，确认index之前的都可以删除
                 if (pendingMap.size() >= maxPendingSize || (DLedgerUtils.elapsed(lastCheckLeakTimeMs) > 1000)) {
                     long peerWaterMark = getPeerWaterMark(term, peerId);
                     for (Long index : pendingMap.keySet()) {
@@ -609,8 +618,11 @@ public class DLedgerEntryPusher {
             switch (target) {
                 case APPEND:
                     compareIndex = -1;
+                    // 更新index
                     updatePeerWaterMark(term, peerId, index);
+                    // 唤醒法定人数检查线程
                     quorumAckChecker.wakeup();
+                    // 从TruncateIndex下一个开始添加
                     writeIndex = index + 1;
                     if (dLedgerConfig.isEnableBatchPush()) {
                         resetBatchAppendEntryRequest();
@@ -665,16 +677,18 @@ public class DLedgerEntryPusher {
                 PreConditions.check(response.getCode() == DLedgerResponseCode.INCONSISTENT_STATE.getCode() || response.getCode() == DLedgerResponseCode.SUCCESS.getCode()
                     , DLedgerResponseCode.valueOf(response.getCode()), "compareIndex=%d", compareIndex);
                 long truncateIndex = -1;
-
+                // 在compareIndex上两者的entry是一致的
                 if (response.getCode() == DLedgerResponseCode.SUCCESS.getCode()) {
                     /*
                      * The comparison is successful:
                      * 1.Just change to append state, if the follower's end index is equal the compared index.
                      * 2.Truncate the follower, if the follower has some dirty entries.
                      */
+                    // 对于follower来说，最后一个index就是compareIndex，则直接append
                     if (compareIndex == response.getEndIndex()) {
                         changeState(compareIndex, PushEntryRequest.Type.APPEND);
                         break;
+                        // 否则truncateIndex等于compareIndex，需要把后面的entry删除
                     } else {
                         truncateIndex = compareIndex;
                     }
@@ -756,8 +770,9 @@ public class DLedgerEntryPusher {
     private class EntryHandler extends ShutdownAbleThread {
 
         private long lastCheckFastForwardTimeMs = System.currentTimeMillis();
-
+        // append use
         ConcurrentMap<Long, Pair<PushEntryRequest, CompletableFuture<PushEntryResponse>>> writeRequestMap = new ConcurrentHashMap<>();
+        // truncate compare and commit use
         BlockingQueue<Pair<PushEntryRequest, CompletableFuture<PushEntryResponse>>> compareOrTruncateRequests = new ArrayBlockingQueue<Pair<PushEntryRequest, CompletableFuture<PushEntryResponse>>>(100);
 
         public EntryHandler(Logger logger) {
@@ -776,6 +791,7 @@ public class DLedgerEntryPusher {
                     }
                     long index = request.getFirstEntryIndex();
                     Pair<PushEntryRequest, CompletableFuture<PushEntryResponse>> old = writeRequestMap.putIfAbsent(index, new Pair<>(request, future));
+                    // 重复推送
                     if (old != null) {
                         logger.warn("[MONITOR]The index {} has already existed with {} and curr is {}", index, old.getKey().baseInfo(), request.baseInfo());
                         future.complete(buildResponse(request, DLedgerResponseCode.REPEATED_PUSH.getCode()));
